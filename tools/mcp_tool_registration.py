@@ -609,10 +609,11 @@ def _register_connected_into_current_scope(servers: dict) -> int:
         if not shared:
             continue
         key, server = shared[0]
-        # Visibility for this profile: the owner keeps teardown, this scope sees the connection.
+        # Install the consuming profile's complete trust/cost policy before publishing visibility.
+        # Otherwise an ACP adopter can observe the connection with no policy record.
+        _record_scope_trust(name, config, scope)
         with _core._lock:
             _core._server_tool_scopes.setdefault(key, set()).add(scope)
-        _record_scope_trust(name, config, scope)
         if registry.get_tool_names_for_toolset(f"mcp-{name}"):
             continue
         candidates = _tool_candidates(name, server._tools, _make_tool_filter(name, config), server.tool_timeout)

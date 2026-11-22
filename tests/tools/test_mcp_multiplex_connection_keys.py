@@ -41,7 +41,7 @@ def two_profiles(tmp_path, monkeypatch):
                "_server_connect_errors", "_server_connect_retry_after", "_server_connect_failures",
                "_server_error_counts", "_server_breaker_opened_at", "_lazy_server_configs",
                "_mcp_tool_server_names", "_orphaned_adopters", "_parallel_safe_servers",
-               "_server_trust_levels", "_tool_read_only_hints")
+               "_server_trust_levels", "_tool_read_only_hints", "_server_cost_policies")
     saved = {n: type(getattr(core, n))(getattr(core, n)) for n in ledgers}
     for n in ledgers:
         getattr(core, n).clear()
@@ -52,10 +52,11 @@ def two_profiles(tmp_path, monkeypatch):
         return hermes_home_key(homes[which])
 
     yield enter
-    for toolset in ("mcp-x", "mcp-s"):
+    for toolset in ("mcp-x", "mcp-s", "mcp-shared"):
         for tool_name in list(registry.get_tool_names_for_toolset(toolset)):
             for home in homes.values():
                 registry.deregister(tool_name, scope=hermes_home_key(home))
+    registry._drop_toolset_aliases("mcp-shared")
     for token in reversed(tokens):
         reset_hermes_home_override(token)
     for n in ledgers:
@@ -244,6 +245,35 @@ def test_owner_reload_reregisters_profiles_that_adopted_its_connection(two_profi
     two_profiles("b")
     assert registry.get_tool_names_for_toolset("mcp-x") == ["mcp__x__t"]
     assert disc.get_mcp_status({"x": cfg})[0]["status"] == "connected"
+
+
+def test_consuming_scope_policy_is_recorded_before_shared_visibility(two_profiles, monkeypatch):
+    """Trust AND cost must be complete before another thread can adopt the shared connection."""
+    import tools.mcp_tool as core
+    from tools import mcp_tool_discovery as disc, mcp_tool_registration as reg
+
+    route = {"url": "https://mcp.example/x", "headers": {"Authorization": "Bearer shared"}}
+    cfg_a = dict(route, trust="full")
+    cfg_b = dict(route, trust="untrusted", tool_costs={"t": 2}, spend_limit=1)
+    scope_a = two_profiles("a")
+    srv_a = _server("x", cfg_a)
+    disc._adopt_server("x", srv_a)
+    srv_a._registered_tool_names = reg._register_server_tools("x", srv_a, cfg_a)
+
+    visible_during_policy_write = []
+    original_record = reg._record_scope_trust
+
+    def record_with_publication_probe(name, config, scope):
+        visible_during_policy_write.append(scope in core._server_tool_scopes.get((scope_a, name), ()))
+        original_record(name, config, scope)
+
+    monkeypatch.setattr(reg, "_record_scope_trust", record_with_publication_probe)
+    scope_b = two_profiles("b")
+    assert reg.register_connected_into_current_scope({"x": cfg_b}) == 1
+    assert visible_during_policy_write == [False]
+    assert core._server_trust_levels[(scope_b, "x")] == core._TRUST_UNTRUSTED
+    assert core._server_cost_policies[(scope_b, "x")].limit == 1
+    assert scope_b in core._server_tool_scopes[(scope_a, "x")]
 
 
 def test_untrusted_adopter_of_a_full_profiles_connection_keeps_its_own_trust_gate(two_profiles, monkeypatch):

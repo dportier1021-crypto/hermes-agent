@@ -253,35 +253,38 @@ def _borrowed(authority, scope, servers, names, cwd, *, partial=False):
     # The cwd too: stdio servers run in it, so a committed workspace move respawns them there.
     wanted = fingerprint([servers, cwd])
     with session_tool_scope(scope):
-        with held.lock:
-            if held.fingerprint not in (None, wanted):
-                # A committed editor_mcp swapped the credentials (or a workspace move the cwd): no
-                # execution may still run on the old ones.
-                if held.users:
-                    raise AuthorityRefusal('session_busy')
-                _disconnect(held, scope)
-            connected = _connected(scope, names)
-            if len(connected) != len(names):
-                register_mcp_servers(_configs(servers, names, cwd))
-                connected = _connected(scope, names)
-            held.fingerprint = wanted
-            held.users += 1
-            # The profile's configured servers stay callable in this scope: the adoption is
-            # released with the last borrower, never adopted by another session or profile.
-            _adopt_profile_connections(scope, held)
+        borrowed = False
         try:
+            with held.lock:
+                if held.fingerprint not in (None, wanted):
+                    # A committed editor_mcp swapped the credentials (or a workspace move the cwd): no
+                    # execution may still run on the old ones.
+                    if held.users:
+                        raise AuthorityRefusal('session_busy')
+                    _disconnect(held, scope)
+                connected = _connected(scope, names)
+                if len(connected) != len(names):
+                    register_mcp_servers(_configs(servers, names, cwd))
+                    connected = _connected(scope, names)
+                held.fingerprint = wanted
+                held.users += 1
+                borrowed = True
+                # Adoption is inside the borrower lifetime: an exception here gets the same
+                # rollback as one from discovery selection or the execution itself.
+                _adopt_profile_connections(scope, held)
             if len(connected) != len(names) and not partial:
                 raise AuthorityRefusal('acp_mcp_discovery_failed')
             toolsets = {f'mcp-{names[i]}' for i in connected}
             tools = [n for n in registry.get_all_tool_names() if registry.get_toolset_for_tool(n) in toolsets]
             yield {n: registry.get_schema(n) for n in sorted(tools)}, connected
         finally:
-            with held.lock:
-                held.users -= 1
-                if not held.users:
-                    _release_profile_connections(scope, held)
-                if not held.users and not _viewed(authority, scope):
-                    _disconnect(held, scope)
+            if borrowed:
+                with held.lock:
+                    held.users -= 1
+                    if not held.users:
+                        _release_profile_connections(scope, held)
+                    if not held.users and not _viewed(authority, scope):
+                        _disconnect(held, scope)
 
 
 def release_editor_mcp(authority, session_ids):

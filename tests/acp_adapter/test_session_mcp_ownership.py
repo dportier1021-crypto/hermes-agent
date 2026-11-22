@@ -118,6 +118,66 @@ def test_profile_mcp_servers_remain_callable_with_editor_servers(server_spec, tm
         shutdown_mcp_servers()
 
 
+def test_adoption_failure_rolls_back_borrower_and_partial_adoption(server_spec, tmp_path, monkeypatch):
+    """An adoption exception must not strand users=1 or leave a partial session share behind."""
+    from gateway import session_local_mcp as local
+    from tools import mcp_tool as core
+    from tools.mcp_tool_discovery import register_mcp_servers
+    from tools.mcp_tool_lifecycle import shutdown_mcp_servers
+    from tools.mcp_tool_scope import _key_name
+    import tools.mcp_tool_config as config_module
+
+    authority = owner()
+    profile_spec = dict(server_spec, name='configured-global')
+    profile_config = {
+        'command': profile_spec['command'],
+        'args': profile_spec['args'],
+        'env': {'BORROWED_CREDENTIAL': 'PRIVATE_GLOBAL'},
+        'trust': 'full',
+    }
+    monkeypatch.setattr(config_module, '_load_mcp_config', lambda: {'configured-global': profile_config})
+    try:
+        register_mcp_servers({'configured-global': profile_config})
+        p = policy(authority, 'adoption-rollback', server_spec, tmp_path)
+        scope = local.session_scope(authority, 'adoption-rollback')
+        held = local._held(authority, scope)
+        key = next(k for k in core._servers if _key_name(k) == 'configured-global')
+        original_adopt = local._adopt_profile_connections
+        original_disconnect = local._disconnect
+        disconnects = []
+
+        def fail_after_partial_adoption(session_scope, session_held):
+            core._server_tool_scopes.setdefault(key, set()).add(session_scope)
+            session_held.adopted.add(key)
+            raise RuntimeError('injected adoption failure')
+
+        with policy_scope(p, authority=authority):
+            monkeypatch.setattr(local, '_adopt_profile_connections', fail_after_partial_adoption)
+            monkeypatch.setattr(local, '_disconnect',
+                                lambda *args: disconnects.append(args) or original_disconnect(*args))
+            with pytest.raises(RuntimeError, match='injected adoption failure'):
+                with policy_scope(p, authority=authority):
+                    pass
+            monkeypatch.setattr(local, '_adopt_profile_connections', original_adopt)
+            # The outer borrower still owns the session: the failed nested borrow rolls back only
+            # itself, without disconnecting or releasing the share the outer borrower is using.
+            assert held.users == 1
+            assert scope in core._server_tool_scopes.get(key, ())
+            assert not disconnects
+        monkeypatch.setattr(local, '_disconnect', original_disconnect)
+
+        # The final borrower has now released everything; immediate rediscovery is not busy.
+        after, _ = local.rebind_editor_mcp(authority, 'adoption-rollback', p, [server_spec])
+        assert held.users == 0
+        assert scope not in core._server_tool_scopes.get(key, ())
+        assert not held.adopted
+        with policy_scope(after, authority=authority):
+            pass
+        assert held.users == 0
+    finally:
+        shutdown_mcp_servers()
+
+
 def test_acp_shared_connection_uses_consuming_profile_trust_and_cost(
         server_spec, tmp_path, monkeypatch, two_profiles):
     """An ACP overlay on B inherits B's policy, never owner A's elevated trust or cost table."""
@@ -135,7 +195,6 @@ def test_acp_shared_connection_uses_consuming_profile_trust_and_cost(
     asked = []
     monkeypatch.setattr(approval_prompt, 'request_elicitation_consent',
                         lambda *args, **kwargs: asked.append(args) or 'deny')
-    monkeypatch.setattr(core, '_server_cost_policies', {})
 
     scope_a = two_profiles('a')
     server_a = shared_server('shared', config_a)
@@ -164,6 +223,69 @@ def test_acp_shared_connection_uses_consuming_profile_trust_and_cost(
         config_cost_policy('shared', config_a)
     assert core._server_cost_policies[_server_key('shared', scope_b, current=False)] == \
         config_cost_policy('shared', config_b)
+
+
+def test_acp_cost_policy_is_complete_before_shared_connection_can_execute(
+        server_spec, tmp_path, monkeypatch, two_profiles):
+    """A read-only costed call cannot slip through the policy-publication window without a charge."""
+    from unittest.mock import AsyncMock
+    from tools import approval_prompt, mcp_tool as core, mcp_tool_costs
+    from tools import mcp_tool_discovery as disc, mcp_tool_handlers as handlers
+    from tools import mcp_tool_registration as reg
+    from tools.mcp_tool_scope import _server_key
+
+    route = {'url': 'https://mcp.example/shared', 'headers': {'Authorization': 'Bearer shared'}}
+    config_a = dict(route, trust='full')
+    config_b = dict(route, trust='full', tool_costs={'t': 3}, spend_limit=2,
+                    cost_unit='borrower-credits')
+    asked = []
+    monkeypatch.setattr(approval_prompt, 'request_elicitation_consent',
+                        lambda *args, **kwargs: asked.append(args) or 'deny')
+    monkeypatch.setattr(mcp_tool_costs, '_spent', {})
+    monkeypatch.setattr(mcp_tool_costs, '_ask_locks', {})
+
+    scope_a = two_profiles('a')
+    server_a = shared_server('shared', config_a)
+    server_a._tools[0].annotations = {'readOnlyHint': True}
+    server_a._rpc_lock = asyncio.Lock()
+    server_a.session = SimpleNamespace(call_tool=AsyncMock(return_value=SimpleNamespace(
+        content=[SimpleNamespace(type='text', text='UNCHARGED')], isError=False,
+        structuredContent=None)))
+    disc._adopt_server('shared', server_a)
+    server_a._registered_tool_names = reg._register_server_tools('shared', server_a, config_a)
+
+    scope_b = two_profiles('b')
+    authority = owner()
+    with disc._owner_secret_scope():
+        p = policy(authority, 'cost-publication', server_spec, tmp_path)
+    owner_key = _server_key('shared', scope_a, current=False)
+    original_record = reg._record_scope_trust
+    partial_results = []
+
+    def pause_at_legacy_publication(name, config, scope):
+        if scope in core._server_tool_scopes.get(owner_key, ()):
+            # Old order: visibility is live but B's trust/cost write has not started. Exercise
+            # the real ACP adoption and call path before releasing the simulated paused writer.
+            with disc._owner_secret_scope():
+                with policy_scope(p, authority=authority, home=scope_b):
+                    partial_results.append(handlers._make_tool_handler('shared', 't', 30.0)({}))
+        original_record(name, config, scope)
+
+    monkeypatch.setattr(reg, '_record_scope_trust', pause_at_legacy_publication)
+    assert reg.register_connected_into_current_scope({'shared': config_b}) == 1
+    if partial_results:
+        raw = partial_results[0]
+    else:
+        # Fixed order reaches here only after B's complete policy and tools were published.
+        with disc._owner_secret_scope():
+            with policy_scope(p, authority=authority, home=scope_b):
+                raw = handlers._make_tool_handler('shared', 't', 30.0)({})
+    result = json.loads(raw)
+    assert 'spend limit' in result.get('error', ''), result
+    assert 'NOT run' in result['error']
+    assert len(asked) == 1
+    server_a.session.call_tool.assert_not_awaited()
+    assert mcp_tool_costs._spent == {}
 
 
 def test_acp_foreign_share_without_consumer_trust_record_fails_closed(
@@ -216,6 +338,16 @@ def test_acp_foreign_share_without_consumer_trust_record_fails_closed(
             assert "untrusted server 'shared'" in result['error']
             assert 'NOT run' in result['error']
             assert len(asked) == 1
+
+
+def test_shared_mcp_registrations_do_not_leak_into_a_following_test():
+    """The imported profile fixture must clean every mcp-shared tool and its process-global alias."""
+    from tools.registry import registry
+    entries = list(registry._tools.values())
+    for slot in registry._scoped_tools.values():
+        entries.extend(slot.values())
+    assert not [entry.name for entry in entries if entry.toolset == 'mcp-shared']
+    assert 'mcp-shared' not in registry._toolset_aliases.values()
 
 
 def test_editor_scopes_are_per_session_and_per_profile():
