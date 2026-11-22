@@ -12,6 +12,7 @@ import pytest
 from gateway.session_policy import policy_scope
 from persistence.core.errors import AuthorityRefusal
 from tests.acp_adapter.test_session_mcp_policy import owner, policy
+from tests.tools.test_mcp_multiplex_connection_keys import _server as shared_server, two_profiles
 
 
 def _editor_servers():
@@ -97,8 +98,16 @@ def test_profile_mcp_servers_remain_callable_with_editor_servers(server_spec, tm
         'command': profile_spec['command'],
         'args': profile_spec['args'],
         'env': {'BORROWED_CREDENTIAL': 'PRIVATE_GLOBAL'},
+        'trust': 'full',
     }
     monkeypatch.setattr(config_module, '_load_mcp_config', lambda: {'configured-global': profile_config})
+    # The ACP overlay has no discovery record on the unfixed path. Its trust gate must therefore
+    # resolve this profile's real config and reach connection resolution, not stop at fail-closed
+    # "server not in config" before exercising the regression.
+    from hermes_constants import get_hermes_home
+    (get_hermes_home() / 'config.yaml').write_text(json.dumps({'mcp_servers': {
+        'configured-global': profile_config,
+    }}))
     try:
         register_mcp_servers({'configured-global': profile_config})
         assert 'PRIVATE_GLOBAL' in registry.dispatch('mcp__configured_global__echo', {})
@@ -107,6 +116,54 @@ def test_profile_mcp_servers_remain_callable_with_editor_servers(server_spec, tm
             assert 'PRIVATE_GLOBAL' in registry.dispatch('mcp__configured_global__echo', {})
     finally:
         shutdown_mcp_servers()
+
+
+def test_acp_shared_connection_uses_consuming_profile_trust_and_cost(
+        server_spec, tmp_path, monkeypatch, two_profiles):
+    """An ACP overlay on B inherits B's policy, never owner A's elevated trust or cost table."""
+    from tools import approval_prompt, mcp_tool as core
+    from tools import mcp_tool_discovery as disc, mcp_tool_registration as reg
+    from tools.mcp_tool_costs import config_cost_policy
+    from tools.mcp_tool_scope import _server_key
+    from tools.registry import registry
+    from gateway.session_local_mcp import session_scope
+
+    route = {'url': 'https://mcp.example/shared', 'headers': {'Authorization': 'Bearer shared'}}
+    config_a = dict(route, trust='full', tool_costs={'t': 11}, cost_unit='owner-credits')
+    config_b = dict(route, trust='untrusted', tool_costs={'t': 3}, spend_limit=5,
+                    cost_unit='borrower-credits')
+    asked = []
+    monkeypatch.setattr(approval_prompt, 'request_elicitation_consent',
+                        lambda *args, **kwargs: asked.append(args) or 'deny')
+    monkeypatch.setattr(core, '_server_cost_policies', {})
+
+    scope_a = two_profiles('a')
+    server_a = shared_server('shared', config_a)
+    disc._adopt_server('shared', server_a)
+    server_a._registered_tool_names = reg._register_server_tools('shared', server_a, config_a)
+
+    scope_b = two_profiles('b')
+    assert reg.register_connected_into_current_scope({'shared': config_b}) == 1
+    authority = owner()
+    with disc._owner_secret_scope():
+        p = policy(authority, 'shared-policy', server_spec, tmp_path)
+        with policy_scope(p, authority=authority, home=scope_b):
+            scope = session_scope(authority, 'shared-policy')
+            policy_key = _server_key('shared', scope, current=False)
+            assert core._server_trust_levels[policy_key] == core._TRUST_UNTRUSTED
+            assert core._server_cost_policies[policy_key] == config_cost_policy('shared', config_b)
+            result = json.loads(registry.dispatch('mcp__shared__t', {}))
+            assert "untrusted server 'shared'" in result['error']
+            assert 'NOT run' in result['error']
+            assert len(asked) == 1
+
+    # Releasing the ACP overlay leaves the owner connection and both profiles' policies intact.
+    assert core._servers[_server_key('shared', scope_a, current=False)] is server_a
+    assert core._server_trust_levels[_server_key('shared', scope_a, current=False)] == core._TRUST_FULL
+    assert core._server_cost_policies[_server_key('shared', scope_a, current=False)] == \
+        config_cost_policy('shared', config_a)
+    assert core._server_cost_policies[_server_key('shared', scope_b, current=False)] == \
+        config_cost_policy('shared', config_b)
 
 
 def test_editor_scopes_are_per_session_and_per_profile():

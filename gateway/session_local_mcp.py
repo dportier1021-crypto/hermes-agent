@@ -187,11 +187,10 @@ def _adopt_profile_connections(scope, held):
     (the ``config.yaml`` ones its gateway booted, a plugin's, a connector's): the session froze
     their toolsets at creation, but its own scope hides every connection it does not own or
     adopt, so each of their calls answered ``not connected``. The share is the multiplexer's own
-    (``_server_tool_scopes``): the connection keeps its owner — teardown, trust discovery — and
-    the session scope is recorded as one more scope it serves, with the tier and cost policy it
-    was discovered with under the session's own key (the call-time gates read the calling
-    scope's). Another profile's connection it did not adopt, and every editor session's, are
-    never taken."""
+    (``_server_tool_scopes``): the connection keeps its owner and teardown, and the session scope
+    is recorded as one more scope it serves. Trust and cost come from the consuming profile's own
+    policy key (never a foreign connection owner's); the session's call-time gates read that copy.
+    Another profile's connection it did not adopt, and every editor session's, are never taken."""
     from tools.mcp_tool import (_lock, _server_cost_policies, _server_scope_keys,
                                _server_tool_scopes, _server_trust_levels, _servers)
     from tools.mcp_tool_scope import _key_name, _key_scope, _server_key
@@ -202,16 +201,20 @@ def _adopt_profile_connections(scope, held):
             if _key_scope(key) == scope or scope in _server_tool_scopes.get(key, ()):
                 continue  # this session's own editor connection, or one it adopted already
             owner = _server_scope_keys.get(key)
+            shared_with_profile = profile in _server_tool_scopes.get(key, ())
             if not ((_key_scope(key) is None and owner in (None, profile))
-                    or owner == profile or profile in _server_tool_scopes.get(key, ())):
+                    or owner == profile or shared_with_profile):
                 continue
             _server_tool_scopes.setdefault(key, set()).add(scope)
             held.adopted.add(key)
-            session_key = _server_key(_key_name(key), scope, current=False)
-            if session_key not in _server_trust_levels and key in _server_trust_levels:
-                _server_trust_levels[session_key] = _server_trust_levels[key]
-            if session_key not in _server_cost_policies and key in _server_cost_policies:
-                _server_cost_policies[session_key] = _server_cost_policies[key]
+            name = _key_name(key)
+            session_key = _server_key(name, scope, current=False)
+            policy_source = (_server_key(name, profile, current=False)
+                             if shared_with_profile and owner != profile else key)
+            if session_key not in _server_trust_levels and policy_source in _server_trust_levels:
+                _server_trust_levels[session_key] = _server_trust_levels[policy_source]
+            if session_key not in _server_cost_policies and policy_source in _server_cost_policies:
+                _server_cost_policies[session_key] = _server_cost_policies[policy_source]
 
 
 def _release_profile_connections(scope, held):
