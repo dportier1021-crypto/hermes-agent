@@ -166,6 +166,58 @@ def test_acp_shared_connection_uses_consuming_profile_trust_and_cost(
         config_cost_policy('shared', config_b)
 
 
+def test_acp_foreign_share_without_consumer_trust_record_fails_closed(
+        server_spec, tmp_path, monkeypatch, two_profiles):
+    """Visibility published before B's trust record must not expose A's connection as full-trust."""
+    from hermes_constants import get_hermes_home
+    from tools import approval_prompt, mcp_tool as core
+    from tools import mcp_tool_discovery as disc, mcp_tool_handlers as handlers
+    from tools import mcp_tool_registration as reg
+    from tools.mcp_tool_scope import _server_key
+    from tools.registry import registry
+    from gateway.session_local_mcp import session_scope
+    import tools.mcp_tool_config as config_module
+
+    route = {'url': 'https://mcp.example/shared', 'headers': {'Authorization': 'Bearer shared'}}
+    config_a = dict(route, trust='full')
+    config_b = dict(route)  # no trust key: config fallback alone would permit full trust
+    asked = []
+    monkeypatch.setattr(approval_prompt, 'request_elicitation_consent',
+                        lambda *args, **kwargs: asked.append(args) or 'deny')
+
+    scope_a = two_profiles('a')
+    server_a = shared_server('shared', config_a)
+    disc._adopt_server('shared', server_a)
+    server_a._registered_tool_names = reg._register_server_tools('shared', server_a, config_a)
+
+    scope_b = two_profiles('b')
+    assert reg.register_connected_into_current_scope({'shared': config_b}) == 1
+    owner_key = _server_key('shared', scope_a, current=False)
+    consumer_key = _server_key('shared', scope_b, current=False)
+    # Reachable registration interleaving: B is visible on A's connection, but its policy write
+    # has not landed. The native config still has no trust key, so fallback would say full.
+    core._server_trust_levels.pop(consumer_key)
+    assert scope_b in core._server_tool_scopes[owner_key]
+    (get_hermes_home() / 'config.yaml').write_text(json.dumps({'mcp_servers': {
+        'shared': config_b,
+    }}))
+    # Editor discovery is the real local stdio fixture; do not also dial the fake HTTP route.
+    monkeypatch.setattr(config_module, '_load_mcp_config', dict)
+
+    authority = owner()
+    with disc._owner_secret_scope():
+        p = policy(authority, 'partial-policy', server_spec, tmp_path)
+        with policy_scope(p, authority=authority, home=scope_b):
+            scope = session_scope(authority, 'partial-policy')
+            session_key = _server_key('shared', scope, current=False)
+            assert handlers._configured_trust('shared', session_key) == core._TRUST_FULL
+            assert core._server_trust_levels[session_key] == core._TRUST_UNTRUSTED
+            result = json.loads(registry.dispatch('mcp__shared__t', {}))
+            assert "untrusted server 'shared'" in result['error']
+            assert 'NOT run' in result['error']
+            assert len(asked) == 1
+
+
 def test_editor_scopes_are_per_session_and_per_profile():
     from gateway.session_local_mcp import session_scope
     one, other = owner(), SimpleNamespace(profile_id='other-profile')

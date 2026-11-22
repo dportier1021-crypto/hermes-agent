@@ -189,9 +189,10 @@ def _adopt_profile_connections(scope, held):
     adopt, so each of their calls answered ``not connected``. The share is the multiplexer's own
     (``_server_tool_scopes``): the connection keeps its owner and teardown, and the session scope
     is recorded as one more scope it serves. Trust and cost come from the consuming profile's own
-    policy key (never a foreign connection owner's); the session's call-time gates read that copy.
-    Another profile's connection it did not adopt, and every editor session's, are never taken."""
-    from tools.mcp_tool import (_lock, _server_cost_policies, _server_scope_keys,
+    policy key (never a foreign connection owner's); a missing foreign-share trust record fails
+    closed. Another profile's connection it did not adopt, and every editor session's, are never
+    taken."""
+    from tools.mcp_tool import (_TRUST_UNTRUSTED, _lock, _server_cost_policies, _server_scope_keys,
                                _server_tool_scopes, _server_trust_levels, _servers)
     from tools.mcp_tool_scope import _key_name, _key_scope, _server_key
     from tools.registry import registry
@@ -209,10 +210,15 @@ def _adopt_profile_connections(scope, held):
             held.adopted.add(key)
             name = _key_name(key)
             session_key = _server_key(name, scope, current=False)
-            policy_source = (_server_key(name, profile, current=False)
-                             if shared_with_profile and owner != profile else key)
-            if session_key not in _server_trust_levels and policy_source in _server_trust_levels:
-                _server_trust_levels[session_key] = _server_trust_levels[policy_source]
+            foreign_shared = shared_with_profile and owner != profile
+            policy_source = _server_key(name, profile, current=False) if foreign_shared else key
+            if session_key not in _server_trust_levels:
+                if policy_source in _server_trust_levels:
+                    _server_trust_levels[session_key] = _server_trust_levels[policy_source]
+                elif foreign_shared:
+                    # Visibility can publish before the consuming profile's policy write lands.
+                    # Never let that partial state fall through to config-derived full trust.
+                    _server_trust_levels[session_key] = _TRUST_UNTRUSTED
             if session_key not in _server_cost_policies and policy_source in _server_cost_policies:
                 _server_cost_policies[session_key] = _server_cost_policies[policy_source]
 
