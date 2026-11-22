@@ -145,12 +145,14 @@ def _configs(servers, names, cwd):
 
 class _Held:
     """One session scope's editor connections. ``users`` executions borrow them right now; between
-    executions they stay connected only while the session has a viewer (``_viewed``)."""
+    executions they stay connected only while the session has a viewer (``_viewed``). ``adopted``
+    names the profile connections the scope borrowed with this session (released with it)."""
 
     def __init__(self):
         self.lock = threading.Lock()
         self.users = 0
         self.fingerprint = None
+        self.adopted = set()
 
 
 def _held(authority, scope):
@@ -180,6 +182,57 @@ def _disconnect(held, scope):
     held.fingerprint = None
 
 
+def _adopt_profile_connections(scope, held):
+    """The session's tool scope also serves the owning profile's already-connected MCP servers
+    (the ``config.yaml`` ones its gateway booted, a plugin's, a connector's): the session froze
+    their toolsets at creation, but its own scope hides every connection it does not own or
+    adopt, so each of their calls answered ``not connected``. The share is the multiplexer's own
+    (``_server_tool_scopes``): the connection keeps its owner — teardown, trust discovery — and
+    the session scope is recorded as one more scope it serves, with the tier and cost policy it
+    was discovered with under the session's own key (the call-time gates read the calling
+    scope's). Another profile's connection it did not adopt, and every editor session's, are
+    never taken."""
+    from tools.mcp_tool import (_lock, _server_cost_policies, _server_scope_keys,
+                               _server_tool_scopes, _server_trust_levels, _servers)
+    from tools.mcp_tool_scope import _key_name, _key_scope, _server_key
+    from tools.registry import registry
+    profile = registry.current_scope_key()
+    with _lock:
+        for key in _servers:
+            if _key_scope(key) == scope or scope in _server_tool_scopes.get(key, ()):
+                continue  # this session's own editor connection, or one it adopted already
+            owner = _server_scope_keys.get(key)
+            if not ((_key_scope(key) is None and owner in (None, profile))
+                    or owner == profile or profile in _server_tool_scopes.get(key, ())):
+                continue
+            _server_tool_scopes.setdefault(key, set()).add(scope)
+            held.adopted.add(key)
+            session_key = _server_key(_key_name(key), scope, current=False)
+            if session_key not in _server_trust_levels and key in _server_trust_levels:
+                _server_trust_levels[session_key] = _server_trust_levels[key]
+            if session_key not in _server_cost_policies and key in _server_cost_policies:
+                _server_cost_policies[session_key] = _server_cost_policies[key]
+
+
+def _release_profile_connections(scope, held):
+    """The last borrower left: the session scope stops serving the profile connections it
+    adopted. Only its own entries go — the owners keep the connections, their teardown and
+    every other scope's share."""
+    from tools.mcp_tool import _lock, _server_cost_policies, _server_tool_scopes, _server_trust_levels
+    from tools.mcp_tool_scope import _key_name, _server_key
+    with _lock:
+        for key in held.adopted:
+            scopes = _server_tool_scopes.get(key)
+            if scopes is not None:
+                scopes.discard(scope)
+                if not scopes:
+                    _server_tool_scopes.pop(key, None)
+            session_key = _server_key(_key_name(key), scope, current=False)
+            _server_trust_levels.pop(session_key, None)
+            _server_cost_policies.pop(session_key, None)
+        held.adopted.clear()
+
+
 @contextmanager
 def _borrowed(authority, scope, servers, names, cwd, *, partial=False):
     """Yield ``(schemas, connected indexes)`` inside the session's tool scope. Only ``partial`` (a
@@ -204,6 +257,9 @@ def _borrowed(authority, scope, servers, names, cwd, *, partial=False):
                 connected = _connected(scope, names)
             held.fingerprint = wanted
             held.users += 1
+            # The profile's configured servers stay callable in this scope: the adoption is
+            # released with the last borrower, never adopted by another session or profile.
+            _adopt_profile_connections(scope, held)
         try:
             if len(connected) != len(names) and not partial:
                 raise AuthorityRefusal('acp_mcp_discovery_failed')
@@ -213,6 +269,8 @@ def _borrowed(authority, scope, servers, names, cwd, *, partial=False):
         finally:
             with held.lock:
                 held.users -= 1
+                if not held.users:
+                    _release_profile_connections(scope, held)
                 if not held.users and not _viewed(authority, scope):
                     _disconnect(held, scope)
 

@@ -84,6 +84,31 @@ def test_unviewed_session_releases_editor_connections_after_execution(server_spe
     assert not _editor_servers()
 
 
+def test_profile_mcp_servers_remain_callable_with_editor_servers(server_spec, tmp_path, monkeypatch):
+    """An editor server must not disconnect the profile's already-live MCP tools."""
+    from tools.mcp_tool_discovery import register_mcp_servers
+    from tools.mcp_tool_lifecycle import shutdown_mcp_servers
+    from tools.registry import registry
+    import tools.mcp_tool_config as config_module
+
+    authority = owner()
+    profile_spec = dict(server_spec, name='configured-global')
+    profile_config = {
+        'command': profile_spec['command'],
+        'args': profile_spec['args'],
+        'env': {'BORROWED_CREDENTIAL': 'PRIVATE_GLOBAL'},
+    }
+    monkeypatch.setattr(config_module, '_load_mcp_config', lambda: {'configured-global': profile_config})
+    try:
+        register_mcp_servers({'configured-global': profile_config})
+        assert 'PRIVATE_GLOBAL' in registry.dispatch('mcp__configured_global__echo', {})
+        p = policy(authority, 'mixed', server_spec, tmp_path)
+        with policy_scope(p, authority=authority):
+            assert 'PRIVATE_GLOBAL' in registry.dispatch('mcp__configured_global__echo', {})
+    finally:
+        shutdown_mcp_servers()
+
+
 def test_editor_scopes_are_per_session_and_per_profile():
     from gateway.session_local_mcp import session_scope
     one, other = owner(), SimpleNamespace(profile_id='other-profile')
